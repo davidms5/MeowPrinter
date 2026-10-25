@@ -72,6 +72,8 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
     private var pendingNotificationPermissionAction: (() -> Unit)? = null
     private var imagePreviewDialog: AlertDialog? = null
     private var shareImportDialog: AlertDialog? = null
+    private var mxw01Battery: Int? = null
+    private var batteryJob: Job? = null
 
     private val imageSection get() = binding.imageSection
     private val settingsSection get() = binding.settingsSection
@@ -357,6 +359,15 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
         imageSection.buttonImageConnection.setOnClickListener {
             ensureBlePermissionsThen { maybeAutoConnect(force = true) }
         }
+
+        imageSection.printerValue.apply {
+            isClickable = true
+
+            setOnClickListener {
+                refreshMxw01Battery()
+            }
+        }
+
         imageSection.buttonPreviewImage.setOnClickListener {
             previewSelectedImage()
         }
@@ -592,10 +603,59 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
         imageEditorLauncher.launch(ImageCropActivity.intent(this, sourceUri, destinationUri))
     }
 
+
+    private fun refreshMxw01Battery() {
+        val manager = printerManager ?: return
+
+        if (!manager.mxw01Mode || !manager.isPrinterReady) {
+            return
+        }
+
+        if (batteryJob?.isActive == true ||
+            ActivePrintController.isPrintActive ||
+            currentJob?.isActive == true
+        ) {
+            return
+        }
+
+        batteryJob = lifecycleScope.launch {
+            try {
+                val value = manager.getMxw01Battery()
+
+                if (printerManager === manager) {
+                    mxw01Battery = value
+                    appendLog("MXW01 battery raw value: $value")
+                    render()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                appendLog(
+                    "MXW01 battery query failed: ${e.message}"
+                )
+            }
+        }
+    }
+
+    private fun getBatteryLabel(): String {
+        val connected = printerManager?.isPrinterReady == true
+
+        return if (connected && printerManager?.mxw01Mode == true) {
+            mxw01Battery?.let { " · Battery: $it ↻" }
+                ?: " · Battery: -- ↻"
+        } else {
+            ""
+        }
+    }
+
     private suspend fun connectToPrinter(printer: DiscoveredPrinter) {
         printerManager?.release()
         val manager = BlePrinterManager(applicationContext) {
             runOnUiThread {
+                batteryJob?.cancel()
+                batteryJob = null
+                mxw01Battery = null
+
                 connectedPrinterName = null
                 currentStatus = getString(R.string.printer_disconnected)
                 appendLog("Printer disconnected.")
@@ -615,7 +675,12 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
             connectedPrinterName = printer.displayName
             currentStatus = getString(R.string.ready_to_print)
             appendLog("Connected to ${printer.displayName}. MTU ${manager.negotiatedMtu}.")
+            mxw01Battery = null
             render()
+
+            if (manager.mxw01Mode) {
+                refreshMxw01Battery()
+            }
         } catch (e: Exception) {
             manager.release()
             printerManager = null
@@ -718,7 +783,8 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
 
                     manager.printMxw01(
                         rows = preparedImage.rows,
-                        intensity = 93
+                        intensity = currentMxw01Intensity(),
+                        pacing = currentPrintPacing()
                     )
                 } else {
                     val commands = CatPrinterProtocol.commandsPrintImageCommands(
@@ -760,7 +826,7 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
         val statusText = currentStatus
         val actionLabel = if (connected) getString(R.string.connected) else getString(R.string.refresh)
         return ConnectionSummary(
-            printerName = printerName,
+            printerName = printerName + getBatteryLabel(),
             statusText = statusText,
             actionLabel = actionLabel,
             actionEnabled = connected.not() && currentJob?.isActive != true,
@@ -803,7 +869,8 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
                     if (manager.mxw01Mode) {
                         manager.printMxw01(
                             rows = PrinterTestPage.createRows(),
-                            intensity = 93
+                            intensity = currentMxw01Intensity(),
+                            pacing = currentPrintPacing()
                         )
                     } else {
                         val commands = CatPrinterProtocol.commandsPrintImageCommands(
@@ -1102,7 +1169,14 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
         val savedPrinterAddress = appSettings.selectedPrinterAddress
         val selectedPrinter = selectedScannedPrinterIndex?.takeIf { it in discoveredPrinters.indices }?.let(discoveredPrinters::get)
 
-        imageSection.printerValue.text = printerName
+
+        imageSection.printerValue.text = printerName + getBatteryLabel()
+        imageSection.printerValue.contentDescription =
+        if (connected && printerManager?.mxw01Mode == true) {
+            "MXW01 battery ${mxw01Battery ?: "unknown"}. Tap to refresh."
+        } else {
+            printerName
+        }
         imageSection.imageStatusValue.text = currentStatus
         imageSection.buttonImageConnection.text = if (connected) getString(R.string.connected) else getString(R.string.refresh)
         imageSection.buttonImageConnection.isEnabled = connected.not() && !isBusy
@@ -1126,7 +1200,7 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
         imageSection.buttonPrintImage.isEnabled = connected && selectedImage != null && !ActivePrintController.isPrintActive && !isBusy
 
         val savedPrinterName = appSettings.selectedPrinterName ?: getString(R.string.no_printer_selected)
-        settingsSection.savedPrinterValue.text = savedPrinterName
+        settingsSection.savedPrinterValue.text = savedPrinterName + getBatteryLabel()
         settingsSection.savedPrinterStatusValue.text = when {
             savedPrinterAddress == null -> ""
             connected && connectedPrinterName == appSettings.selectedPrinterName -> currentStatus
@@ -1256,6 +1330,13 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
 
     private fun currentPrintEnergy(): Int {
         return appSettings.selectedPrintEnergyProfile.toEnergy(appSettings.selectedCustomPrintEnergyPercent)
+    }
+
+    private fun currentMxw01Intensity(): Int {
+        val percent = PrintEnergy.toPercent(currentPrintEnergy())
+        .coerceIn(0, 100)
+
+        return (percent * 150 / 100).coerceIn(0, 150)
     }
 
     private fun hasBlePermissions(): Boolean {

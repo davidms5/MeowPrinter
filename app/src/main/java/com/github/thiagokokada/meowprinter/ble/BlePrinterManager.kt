@@ -114,7 +114,8 @@ class BlePrinterManager(
 
     suspend fun printMxw01(
         rows: List<BooleanArray>,
-        intensity: Int = 93
+        intensity: Int = 93,
+        pacing: PrintPacing = PrintPacingProfile.BALANCED.toPacing(100)
     ) {
         check(mxw01Mode) { "MXW01 mode is not enabled." }
         check(isConnected) { "Printer is disconnected." }
@@ -171,7 +172,10 @@ class BlePrinterManager(
                     )
                 )
 
-                delay(20)
+                val chunkDelayMs =
+                    (pacing.rowCommandDelayMs + 20L).coerceIn(8L, 50L)
+
+                delay(chunkDelayMs)
             }
 
             // Indicar que terminó la transferencia.
@@ -206,6 +210,26 @@ class BlePrinterManager(
             mxw01PendingId = null
             mxw01PendingResponse = null
         }
+    }
+
+    suspend fun getMxw01Battery(): Int {
+        check(mxw01Mode) {
+            "Battery query only supported in MXW01 mode."
+        }
+
+        val response = mxw01Request(
+            0xAB,
+            Mxw01Protocol.getBattery()
+        )
+
+        val payload = Mxw01Protocol.notificationPayload(response)
+            ?: throw IOException("Invalid battery response.")
+
+        if (payload.isEmpty()) {
+            throw IOException("Empty battery response.")
+        }
+
+        return payload[0].toInt() and 0xFF
     }
 
     private fun ByteArray.toHexString(): String =
