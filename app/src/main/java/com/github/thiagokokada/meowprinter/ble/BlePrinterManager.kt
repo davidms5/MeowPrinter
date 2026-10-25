@@ -17,6 +17,8 @@ import no.nordicsemi.android.ble.observer.ConnectionObserver
 import java.io.IOException
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import com.github.thiagokokada.meowprinter.print.Mxw01Protocol
+import android.util.Log
 
 class BlePrinterManager(
     context: Context,
@@ -24,6 +26,14 @@ class BlePrinterManager(
 ) : BleManager(context) {
     private var txCharacteristic: BluetoothGattCharacteristic? = null
     private var rxCharacteristic: BluetoothGattCharacteristic? = null
+
+    private var mxw01DataCharacteristic: BluetoothGattCharacteristic? = null
+
+    var mxw01Mode: Boolean = false
+
+    private var mxw01PendingId: Int? = null
+    private var mxw01PendingResponse: CompletableDeferred<ByteArray>? = null
+
     private var readySignal = CompletableDeferred<Unit>()
     private var suppressDisconnectCallback = false
 
@@ -101,6 +111,109 @@ class BlePrinterManager(
         }
     }
 
+
+    suspend fun printMxw01(
+        rows: List<BooleanArray>,
+        intensity: Int = 93
+    ) {
+        check(mxw01Mode) { "MXW01 mode is not enabled." }
+        check(isConnected) { "Printer is disconnected." }
+
+        val dataChannel = mxw01DataCharacteristic
+            ?: throw IOException("MXW01 AE03 channel unavailable.")
+
+        val image = Mxw01Protocol.encodeImage(rows)
+        val paddedLines = image.size / 48
+
+        // Configurar oscuridad de impresión.
+        send(Mxw01Protocol.setIntensity(intensity))
+
+        // Comprobar estado.
+        val status = mxw01Request(0xA1, Mxw01Protocol.getStatus())
+        android.util.Log.d(
+            "MeowMXW01",
+            "Status: " + status.toHexString()
+        )
+
+        // Solicitar impresión y comprobar aceptación.
+        val accepted = mxw01Request(
+            0xA9,
+            Mxw01Protocol.startPrint(paddedLines)
+        )
+
+        val response = Mxw01Protocol.notificationPayload(accepted)
+            ?: throw IOException("Invalid MXW01 print acknowledgment.")
+
+        if (response.firstOrNull()?.toInt() != 0) {
+            throw IOException("MXW01 rejected print request.")
+        }
+
+        // Registrar espera de finalización ANTES de enviar el trabajo.
+        val completed = CompletableDeferred<ByteArray>()
+        mxw01PendingId = 0xAA
+        mxw01PendingResponse = completed
+
+        try {
+            val chunkSize = (negotiatedMtu - 3)
+                .coerceIn(20, 244)
+
+            for (offset in image.indices step chunkSize) {
+                val chunk = image.copyOfRange(
+                    offset,
+                    minOf(offset + chunkSize, image.size)
+                )
+
+                await(
+                    writeCharacteristic(
+                        dataChannel,
+                        chunk,
+                        preferredWriteType(dataChannel)
+                    )
+                )
+
+                delay(20)
+            }
+
+            // Indicar que terminó la transferencia.
+            send(Mxw01Protocol.finishPrint())
+
+            // Esperar confirmación física de impresión.
+            withTimeout(60_000) {
+                completed.await()
+            }
+        } finally {
+            mxw01PendingId = null
+            mxw01PendingResponse = null
+        }
+    }
+
+    private suspend fun mxw01Request(
+        responseId: Int,
+        command: ByteArray
+    ): ByteArray {
+        val response = CompletableDeferred<ByteArray>()
+
+        mxw01PendingId = responseId
+        mxw01PendingResponse = response
+
+        try {
+            send(command)
+
+            return withTimeout(10_000) {
+                response.await()
+            }
+        } finally {
+            mxw01PendingId = null
+            mxw01PendingResponse = null
+        }
+    }
+
+    private fun ByteArray.toHexString(): String =
+        joinToString(" ") {
+            "%02X".format(it.toInt() and 0xFF)
+        }
+
+
     fun release() {
         suppressDisconnectCallback = true
         if (isConnected) {
@@ -118,6 +231,7 @@ class BlePrinterManager(
 
             txCharacteristic = service?.getCharacteristic(CatPrinterProtocol.txCharacteristicUuid)
             rxCharacteristic = service?.getCharacteristic(CatPrinterProtocol.rxCharacteristicUuid)
+            mxw01DataCharacteristic = service?.getCharacteristic(Mxw01Protocol.dataCharacteristicUuid)
 
             val txValid = txCharacteristic?.properties?.let { properties ->
                 properties and (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
@@ -125,7 +239,15 @@ class BlePrinterManager(
             val rxValid = rxCharacteristic?.properties?.let { properties ->
                 properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
             } == true
-            return txValid && rxValid
+            val dataValid =
+                mxw01DataCharacteristic?.properties?.let { properties ->
+                    properties and (
+                        BluetoothGattCharacteristic.PROPERTY_WRITE or
+                            BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE
+                    ) != 0
+                } == true
+
+            return txValid && rxValid && (!mxw01Mode || dataValid)
         }
 
         @Deprecated("Required override from Nordic BleManager API.")
@@ -133,6 +255,18 @@ class BlePrinterManager(
             val rx = requireNotNull(rxCharacteristic)
             setNotificationCallback(rx).with { _, data ->
                 val value = data.value ?: return@with
+
+                if (mxw01Mode) {
+                    val id = Mxw01Protocol.notificationId(value)
+
+                    if (
+                        id != null &&
+                        id == mxw01PendingId &&
+                        mxw01PendingResponse?.isCompleted == false
+                    ) {
+                        mxw01PendingResponse?.complete(value)
+                    }
+                }
                 if (value.contentEquals(CatPrinterProtocol.readyNotification) && !readySignal.isCompleted) {
                     readySignal.complete(Unit)
                 }
@@ -150,6 +284,10 @@ class BlePrinterManager(
             txCharacteristic = null
             rxCharacteristic = null
             negotiatedMtu = DEFAULT_MTU
+            mxw01DataCharacteristic = null
+            mxw01PendingResponse?.cancel()
+            mxw01PendingResponse = null
+            mxw01PendingId = null
         }
     }
 

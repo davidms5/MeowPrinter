@@ -603,6 +603,8 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
                 render()
             }
         }
+
+        manager.mxw01Mode = printer.displayName.equals("MXW01", ignoreCase = true)
         printerManager = manager
         try {
             currentStatus = getString(R.string.connecting)
@@ -709,20 +711,33 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
             try {
                 val energy = currentPrintEnergy()
                 val energyLabel = formatEnergy(PrintEnergy.toPercent(energy))
-                val commands = CatPrinterProtocol.commandsPrintImageCommands(
-                    preparedImage.rows,
-                    energy = energy,
-                    printGapSteps = appSettings.selectedPaperMoveSteps,
-                    endPaperPasses = appSettings.selectedEndPaperPasses
-                )
-                val payloadSize = commands.sumOf { it.size }
-                appendLog(
-                    "Generated ${preparedImage.rows.size} rows and $payloadSize bytes from $sourceLabel at $energyLabel. Gap ${appSettings.selectedPaperMoveSteps} steps, end passes ${appSettings.selectedEndPaperPasses}."
-                )
-                currentStatus = getString(R.string.printing_selected_image_with_energy, energyLabel)
-                render()
+                if (manager.mxw01Mode) {
+                    appendLog(
+                        "MXW01: printing ${preparedImage.rows.size} rows."
+                    )
 
-                manager.printCommands(commands, currentPrintPacing())
+                    manager.printMxw01(
+                        rows = preparedImage.rows,
+                        intensity = 93
+                    )
+                } else {
+                    val commands = CatPrinterProtocol.commandsPrintImageCommands(
+                        preparedImage.rows,
+                        energy = energy,
+                        printGapSteps = appSettings.selectedPaperMoveSteps,
+                        endPaperPasses = appSettings.selectedEndPaperPasses
+                    )
+
+                    manager.printCommands(commands, currentPrintPacing())
+                }
+                //val payloadSize = commands.sumOf { it.size }
+                //appendLog(
+                //    "Generated ${preparedImage.rows.size} rows and $payloadSize bytes from $sourceLabel at $energyLabel. Gap ${appSettings.selectedPaperMoveSteps} steps, end passes ${appSettings.selectedEndPaperPasses}."
+                //)
+                //currentStatus = getString(R.string.printing_selected_image_with_energy, energyLabel)
+                //render()
+
+
 
                 currentStatus = getString(R.string.printer_ready_again)
                 appendLog("Image print completed successfully.")
@@ -785,13 +800,22 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
                     val energyLabel = formatEnergy(PrintEnergy.toPercent(energy))
                     currentStatus = getString(R.string.testing_saved_printer_with_energy, energyLabel)
                     render()
-                    val commands = CatPrinterProtocol.commandsPrintImageCommands(
-                        PrinterTestPage.createRows(),
-                        energy = energy,
-                        printGapSteps = appSettings.selectedPaperMoveSteps,
-                        endPaperPasses = appSettings.selectedEndPaperPasses
-                    )
-                    manager.printCommands(commands, currentPrintPacing())
+                    if (manager.mxw01Mode) {
+                        manager.printMxw01(
+                            rows = PrinterTestPage.createRows(),
+                            intensity = 93
+                        )
+                    } else {
+                        val commands = CatPrinterProtocol.commandsPrintImageCommands(
+                            PrinterTestPage.createRows(),
+                            energy = energy,
+                            printGapSteps = appSettings.selectedPaperMoveSteps,
+                            endPaperPasses = appSettings.selectedEndPaperPasses
+                        )
+
+                        manager.printCommands(commands, currentPrintPacing())
+                    }
+                    //manager.printCommands(commands, currentPrintPacing())
                     appendLog("Test page printed on $printerName at $energyLabel. Gap ${appSettings.selectedPaperMoveSteps} steps, end passes ${appSettings.selectedEndPaperPasses}.")
                     currentStatus = getString(R.string.test_page_sent)
                 }
