@@ -1,4 +1,3 @@
-
 package com.github.thiagokokada.meowprinter.print
 
 import java.io.ByteArrayOutputStream
@@ -6,13 +5,14 @@ import java.util.UUID
 
 object Mxw01Protocol {
     const val PRINT_WIDTH = 384
-    private const val BYTES_PER_ROW = PRINT_WIDTH / 8
+    const val BYTES_PER_ROW = PRINT_WIDTH / 8
     private const val MIN_IMAGE_BYTES = 4320
 
     val dataCharacteristicUuid: UUID =
         UUID.fromString("0000ae03-0000-1000-8000-00805f9b34fb")
 
     fun command(id: Int, payload: ByteArray = byteArrayOf(0)): ByteArray {
+        require(id in 0..255)
         require(payload.size <= 65535)
 
         val output = ByteArray(8 + payload.size)
@@ -82,21 +82,23 @@ object Mxw01Protocol {
         }
     }
 
-    fun notificationId(packet: ByteArray): Int? {
-        if (packet.size < 8) return null
+    data class Notification(val id: Int, val payload: ByteArray)
+
+    /**
+     * Accept only a complete declared payload. Public firmware reports disagree about
+     * trailing CRC/footer bytes, so do not require or interpret them without captures.
+     * This parses one notification, not a fragmented or concatenated byte stream.
+     */
+    fun parseNotification(packet: ByteArray): Notification? {
+        if (packet.size < 6) return null
         if ((packet[0].toInt() and 0xFF) != 0x22) return null
         if ((packet[1].toInt() and 0xFF) != 0x21) return null
-        return packet[2].toInt() and 0xFF
-    }
-
-    fun notificationPayload(packet: ByteArray): ByteArray? {
-        if (notificationId(packet) == null) return null
 
         val length = (packet[4].toInt() and 0xFF) or
             ((packet[5].toInt() and 0xFF) shl 8)
 
-        if (packet.size < 6 + length + 1) return null
-        return packet.copyOfRange(6, 6 + length)
+        if (packet.size < 6 + length) return null
+        return Notification(packet[2].toInt() and 0xFF, packet.copyOfRange(6, 6 + length))
     }
 
     private fun crc8(data: ByteArray): Byte {

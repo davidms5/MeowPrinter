@@ -68,6 +68,41 @@ class MainActivityTest {
     }
 
     @Test
+    fun savedMxw01DisablesUnverifiedPaperSettingsWithoutHardware() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        // No address: do not scan or connect to external hardware in this smoke test.
+        AppSettings(context).selectedPrinterName = "MXW01"
+        launchMainActivity { activity ->
+            activity.findViewById<BottomNavigationView>(R.id.bottom_navigation).selectedItemId =
+                R.id.navigation_settings
+            assertEquals(false, activity.findViewById<View>(R.id.input_layout_paper_move_steps).isEnabled)
+            assertEquals(false, activity.findViewById<View>(R.id.button_paper_steps_25).isEnabled)
+            assertEquals(false, activity.findViewById<View>(R.id.spinner_end_paper_passes).isEnabled)
+            assertEquals(
+                activity.getString(R.string.mxw01_paper_movement_unsupported),
+                activity.findViewById<TextView>(R.id.paper_move_steps_subtitle).text.toString()
+            )
+            assertEquals(
+                activity.getString(R.string.mxw01_pacing_subtitle),
+                activity.findViewById<TextView>(R.id.print_pacing_subtitle).text.toString()
+            )
+            assertEquals(false, activity.findViewById<View>(R.id.printer_value).isClickable)
+        }
+    }
+
+    @Test
+    fun classicPaperSettingsRemainAvailableAndBatteryLabelDoesNotClaimPercentage() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        AppSettings(context).selectedPrinterName = "GT01"
+        launchMainActivity { activity ->
+            assertEquals(true, activity.findViewById<View>(R.id.input_layout_paper_move_steps).isEnabled)
+            assertEquals(true, activity.findViewById<View>(R.id.spinner_end_paper_passes).isEnabled)
+            assertEquals(" · Battery: 68", activity.getString(R.string.mxw01_battery_raw, 68))
+            assertEquals(" · Battery: --", activity.getString(R.string.mxw01_battery_unknown))
+        }
+    }
+
+    @Test
     fun openingSettingsShowsSavedPrinterCard() {
         launchMainActivity { activity ->
             activity.findViewById<BottomNavigationView>(R.id.bottom_navigation).selectedItemId =

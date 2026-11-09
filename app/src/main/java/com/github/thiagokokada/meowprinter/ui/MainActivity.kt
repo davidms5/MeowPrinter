@@ -35,9 +35,11 @@ import com.github.thiagokokada.meowprinter.image.ImageResizerMode
 import com.github.thiagokokada.meowprinter.image.PreviewBitmapScaler
 import com.github.thiagokokada.meowprinter.image.PreparedPrintImage
 import com.github.thiagokokada.meowprinter.print.CatPrinterProtocol
+import com.github.thiagokokada.meowprinter.print.Mxw01Intensity
 import com.github.thiagokokada.meowprinter.print.PrintEnergy
 import com.github.thiagokokada.meowprinter.print.PrintEnergyProfile
 import com.github.thiagokokada.meowprinter.print.PrinterTestPage
+import com.github.thiagokokada.meowprinter.print.PrinterProtocolProfile
 import com.mikepenz.iconics.IconicsDrawable
 import com.mikepenz.iconics.typeface.library.fontawesome.FontAwesome
 import kotlinx.coroutines.CancellationException
@@ -427,6 +429,7 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
 
     override fun onDestroy() {
         currentJob?.cancel()
+        batteryJob?.cancel()
         imagePreviewDialog?.dismiss()
         imagePreviewDialog = null
         shareImportDialog?.dismiss()
@@ -607,7 +610,7 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
     private fun refreshMxw01Battery() {
         val manager = printerManager ?: return
 
-        if (!manager.mxw01Mode || !manager.isPrinterReady) {
+        if (!manager.protocolProfile.supportsBattery || !manager.isPrinterReady) {
             return
         }
 
@@ -633,6 +636,8 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
                 appendLog(
                     "MXW01 battery query failed: ${e.message}"
                 )
+            } finally {
+                if (printerManager === manager) render()
             }
         }
     }
@@ -640,18 +645,25 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
     private fun getBatteryLabel(): String {
         val connected = printerManager?.isPrinterReady == true
 
-        return if (connected && printerManager?.mxw01Mode == true) {
-            mxw01Battery?.let { " · Battery: $it ↻" }
-                ?: " · Battery: -- ↻"
+        return if (connected && printerManager?.protocolProfile?.supportsBattery == true) {
+            mxw01Battery?.let { getString(R.string.mxw01_battery_raw, it) }
+                ?: getString(R.string.mxw01_battery_unknown)
         } else {
             ""
         }
     }
 
     private suspend fun connectToPrinter(printer: DiscoveredPrinter) {
+        batteryJob?.cancel()
+        batteryJob = null
+        mxw01Battery = null
         printerManager?.release()
-        val manager = BlePrinterManager(applicationContext) {
+        val manager = BlePrinterManager(
+            applicationContext,
+            PrinterProtocolProfile.forAdvertisedName(printer.displayName)
+        ) { disconnectedManager ->
             runOnUiThread {
+                if (printerManager !== disconnectedManager) return@runOnUiThread
                 batteryJob?.cancel()
                 batteryJob = null
                 mxw01Battery = null
@@ -660,17 +672,19 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
                 currentStatus = getString(R.string.printer_disconnected)
                 appendLog("Printer disconnected.")
                 printerManager = null
+                disconnectedManager.release()
                 render()
             }
         }
 
-        manager.mxw01Mode = printer.displayName.equals("MXW01", ignoreCase = true)
         printerManager = manager
         try {
             currentStatus = getString(R.string.connecting)
             render()
 
             manager.connectAndInitialize(printer.device)
+            if (printerManager !== manager) return
+            check(manager.isPrinterReady) { "Printer initialization did not complete." }
 
             connectedPrinterName = printer.displayName
             currentStatus = getString(R.string.ready_to_print)
@@ -678,11 +692,16 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
             mxw01Battery = null
             render()
 
-            if (manager.mxw01Mode) {
-                refreshMxw01Battery()
+        } catch (e: CancellationException) {
+            manager.release()
+            if (printerManager === manager) {
+                printerManager = null
+                connectedPrinterName = null
             }
+            throw e
         } catch (e: Exception) {
             manager.release()
+            if (printerManager !== manager) return
             printerManager = null
             connectedPrinterName = null
             currentStatus = getString(R.string.connection_failed)
@@ -767,7 +786,6 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
         val manager = printerManager
         if (manager == null || !manager.isPrinterReady) {
             Toast.makeText(this, R.string.not_connected, Toast.LENGTH_SHORT).show()
-            ensureBlePermissionsThen { maybeAutoConnect(force = true) }
             return
         }
 
@@ -776,9 +794,11 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
             try {
                 val energy = currentPrintEnergy()
                 val energyLabel = formatEnergy(PrintEnergy.toPercent(energy))
-                if (manager.mxw01Mode) {
+                currentStatus = getString(R.string.printing_selected_image_with_energy, energyLabel)
+                render()
+                if (manager.protocolProfile == PrinterProtocolProfile.MXW01) {
                     appendLog(
-                        "MXW01: printing ${preparedImage.rows.size} rows."
+                        "MXW01: printing ${preparedImage.rows.size} rows from $sourceLabel at intensity ${currentMxw01Intensity()}."
                     )
 
                     manager.printMxw01(
@@ -793,18 +813,12 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
                         printGapSteps = appSettings.selectedPaperMoveSteps,
                         endPaperPasses = appSettings.selectedEndPaperPasses
                     )
-
+                    val payloadSize = commands.sumOf { it.size }
+                    appendLog(
+                        "Generated ${preparedImage.rows.size} rows and $payloadSize bytes from $sourceLabel at $energyLabel. Gap ${appSettings.selectedPaperMoveSteps} steps, end passes ${appSettings.selectedEndPaperPasses}."
+                    )
                     manager.printCommands(commands, currentPrintPacing())
                 }
-                //val payloadSize = commands.sumOf { it.size }
-                //appendLog(
-                //    "Generated ${preparedImage.rows.size} rows and $payloadSize bytes from $sourceLabel at $energyLabel. Gap ${appSettings.selectedPaperMoveSteps} steps, end passes ${appSettings.selectedEndPaperPasses}."
-                //)
-                //currentStatus = getString(R.string.printing_selected_image_with_energy, energyLabel)
-                //render()
-
-
-
                 currentStatus = getString(R.string.printer_ready_again)
                 appendLog("Image print completed successfully.")
             } catch (_: CancellationException) {
@@ -866,12 +880,13 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
                     val energyLabel = formatEnergy(PrintEnergy.toPercent(energy))
                     currentStatus = getString(R.string.testing_saved_printer_with_energy, energyLabel)
                     render()
-                    if (manager.mxw01Mode) {
+                    if (manager.protocolProfile == PrinterProtocolProfile.MXW01) {
                         manager.printMxw01(
                             rows = PrinterTestPage.createRows(),
                             intensity = currentMxw01Intensity(),
                             pacing = currentPrintPacing()
                         )
+                        appendLog("Test page printed on $printerName at MXW01 intensity ${currentMxw01Intensity()}.")
                     } else {
                         val commands = CatPrinterProtocol.commandsPrintImageCommands(
                             PrinterTestPage.createRows(),
@@ -881,9 +896,8 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
                         )
 
                         manager.printCommands(commands, currentPrintPacing())
+                        appendLog("Test page printed on $printerName at $energyLabel. Gap ${appSettings.selectedPaperMoveSteps} steps, end passes ${appSettings.selectedEndPaperPasses}.")
                     }
-                    //manager.printCommands(commands, currentPrintPacing())
-                    appendLog("Test page printed on $printerName at $energyLabel. Gap ${appSettings.selectedPaperMoveSteps} steps, end passes ${appSettings.selectedEndPaperPasses}.")
                     currentStatus = getString(R.string.test_page_sent)
                 }
             } catch (_: CancellationException) {
@@ -918,6 +932,10 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
         runTrackedJob(progressStatus) { launchedJob ->
             try {
                 withSavedPrinterManager(printerAddress) { printerName, manager ->
+                    if (!manager.protocolProfile.supportsPaperMovement) {
+                        currentStatus = getString(R.string.mxw01_paper_movement_unsupported)
+                        return@withSavedPrinterManager
+                    }
                     val steps = appSettings.selectedPaperMoveSteps
                     val payload = if (forward) {
                         CatPrinterProtocol.cmdAdvancePaper(steps)
@@ -986,6 +1004,9 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
     }
 
     private fun disconnectForegroundConnection() {
+        batteryJob?.cancel()
+        batteryJob = null
+        mxw01Battery = null
         printerManager?.release()
         printerManager = null
         connectedPrinterName = null
@@ -1149,9 +1170,11 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
     private fun finishTrackedJob(job: Job) {
         if (currentJob === job) {
             currentJob = null
+            binding.progressIndicator.isVisible = false
+            render()
+            // Run only after the connection/print job is no longer marked busy.
+            if (mxw01Battery == null) refreshMxw01Battery()
         }
-        binding.progressIndicator.isVisible = false
-        render()
     }
 
     private fun appendLog(message: String) {
@@ -1171,9 +1194,11 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
 
 
         imageSection.printerValue.text = printerName + getBatteryLabel()
-        imageSection.printerValue.contentDescription =
-        if (connected && printerManager?.mxw01Mode == true) {
-            "MXW01 battery ${mxw01Battery ?: "unknown"}. Tap to refresh."
+        val canRefreshBattery = connected && printerManager?.protocolProfile?.supportsBattery == true
+        imageSection.printerValue.isClickable = canRefreshBattery
+        imageSection.printerValue.isFocusable = canRefreshBattery
+        imageSection.printerValue.contentDescription = if (canRefreshBattery) {
+            getString(R.string.mxw01_battery_refresh_description, printerName + getBatteryLabel())
         } else {
             printerName
         }
@@ -1245,8 +1270,23 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
         settingsSection.buttonScanPrinters.isEnabled = !isBusy
         settingsSection.buttonSavePrinter.isEnabled = selectedPrinter != null && !isBusy
         settingsSection.buttonTestPrint.isEnabled = appSettings.selectedPrinterAddress != null && !isBusy
-        settingsSection.buttonAdvancePaper.isEnabled = appSettings.selectedPrinterAddress != null && !isBusy
-        settingsSection.buttonRetractPaper.isEnabled = appSettings.selectedPrinterAddress != null && !isBusy
+        val supportsPaperMovement = (printerManager?.protocolProfile
+            ?: PrinterProtocolProfile.forAdvertisedName(appSettings.selectedPrinterName)).supportsPaperMovement
+        settingsSection.buttonAdvancePaper.isEnabled = savedPrinterAddress != null && !isBusy && supportsPaperMovement
+        settingsSection.buttonRetractPaper.isEnabled = savedPrinterAddress != null && !isBusy && supportsPaperMovement
+        settingsSection.inputLayoutPaperMoveSteps.isEnabled = supportsPaperMovement
+        settingsSection.spinnerEndPaperPasses.isEnabled = supportsPaperMovement
+        listOf(
+            settingsSection.buttonPaperSteps10, settingsSection.buttonPaperSteps25,
+            settingsSection.buttonPaperSteps50, settingsSection.buttonPaperSteps100
+        ).forEach { it.isEnabled = supportsPaperMovement }
+        settingsSection.paperMoveStepsSubtitle.text = getString(
+            if (supportsPaperMovement) R.string.paper_move_steps_subtitle
+            else R.string.mxw01_paper_movement_unsupported
+        )
+        settingsSection.printPacingSubtitle.text = getString(
+            if (supportsPaperMovement) R.string.print_pacing_subtitle else R.string.mxw01_pacing_subtitle
+        )
         settingsSection.buttonOpenLogs.isEnabled = true
         renderPrinterChoices()
         (supportFragmentManager.findFragmentById(R.id.text_fragment_container) as? TextFragment)
@@ -1333,10 +1373,7 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
     }
 
     private fun currentMxw01Intensity(): Int {
-        val percent = PrintEnergy.toPercent(currentPrintEnergy())
-        .coerceIn(0, 100)
-
-        return (percent * 150 / 100).coerceIn(0, 150)
+        return Mxw01Intensity.fromEnergySetting(currentPrintEnergy())
     }
 
     private fun hasBlePermissions(): Boolean {
