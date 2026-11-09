@@ -75,6 +75,10 @@ Manual advance/retract and end-of-job paper settings are not implemented for
 MXW01. Their UI is disabled and the action checks capabilities after reconnection.
 4bpp/HD modes, unverified movement commands, and broad V5X support are out of scope.
 Opening the image editor retains the app's existing disconnect/reconnect behavior.
+After selecting/editing another image, Refresh may be needed if image preparation
+interrupts reconnection. The contributor confirmed that once connected, changing
+dithering on the same selected image no longer leaves the UI loading or disconnects
+the printer. Improving reconnection after image selection is a separate follow-up.
 
 ## Verification before submitting the PR
 
@@ -88,6 +92,8 @@ Automated checks:
 
 Hardware regression checklist (record Android version, advertised name and MTU):
 
+- [x] Once connected, change dithering on the same image without a stuck loading
+  indicator or a printer disconnection (confirmed by the contributor).
 - [ ] Connect and observe the automatic raw battery query; manually refresh it.
 - [ ] Start a print immediately after a manual battery refresh; neither should
   time out or consume the other's response.

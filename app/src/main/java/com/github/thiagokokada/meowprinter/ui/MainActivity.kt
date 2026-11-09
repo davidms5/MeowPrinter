@@ -43,6 +43,7 @@ import com.github.thiagokokada.meowprinter.print.PrinterProtocolProfile
 import com.mikepenz.iconics.IconicsDrawable
 import com.mikepenz.iconics.typeface.library.fontawesome.FontAwesome
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.launch
@@ -750,6 +751,11 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
         render()
     }
 
+    internal fun prepareSelectedImageForTest(uri: Uri) {
+        selectedImageUri = uri
+        prepareSelectedImage(uri, appendPreparedLog = true)
+    }
+
     internal fun isImagePreviewDialogShowingForTest(): Boolean {
         return imagePreviewDialog?.isShowing == true
     }
@@ -1016,7 +1022,9 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
 
     private fun runTrackedJob(status: String, block: suspend (Job) -> Unit) {
         currentJob?.cancel()
-        val launchedJob = lifecycleScope.launch {
+        // Main.immediate can finish non-suspending image preparation before launch
+        // returns. Register the job first so its cleanup can recognize it.
+        val launchedJob = lifecycleScope.launch(start = CoroutineStart.LAZY) {
             val job = currentCoroutineContext()[Job] ?: return@launch
             currentStatus = status
             binding.progressIndicator.isVisible = true
@@ -1024,6 +1032,7 @@ class MainActivity : AppCompatActivity(), TextFragment.Host {
             block(job)
         }
         currentJob = launchedJob
+        launchedJob.start()
     }
 
     private fun beginActivePrint(job: Job) {
